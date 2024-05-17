@@ -18,54 +18,76 @@ type routeArg struct {
 	route net.IP
 }
 
-func (ra *routeArg) encode() string {
+var ErrMaskTooLarge = errors.New("mask too large")
+var ErrIPNotV4 = errors.New("route must specify a valid IPv4 address")
+var ErrMaskNotV4 = errors.New("network and mask must specify a valid IPv4 address")
+
+func (ra *routeArg) encode() (string, error) {
+	// max length of a route arg is 9 bytes, which is 18 bytes of hex
 	var b [18]byte
 
 	routeIP := ra.route.To4()
 	if routeIP == nil {
-		return ""
+		return "", ErrIPNotV4
 	}
 
 	maskIP := ra.ipnet.IP.To4()
 	if maskIP == nil {
-		return ""
+		return "", ErrMaskNotV4
 	}
 	ones, _ := ra.ipnet.Mask.Size()
 	if ones > 32 {
-		return ""
+		return "", ErrMaskTooLarge
 	}
+	// get significant bytes
 	sigs := sigBytes(ones)
+
+	// encode cidr bits
 	hex.Encode(b[0:2], []byte{byte(ones)})
 	maskEnd := sigs*2 + 2
+
+	// encode the network address
 	hex.Encode(b[2:maskEnd], maskIP[:sigs])
 	routeEnd := maskEnd + 8
+
+	// encode the route
 	hex.Encode(b[maskEnd:routeEnd], routeIP)
-	return string(b[:routeEnd])
+
+	return string(b[:routeEnd]), nil
 }
+
+var ErrHexTooShort = errors.New("hex value too short")
+
+var ErrInvalidLength = errors.New("invalid length")
 
 func routeArgsFromHex(s string) ([]routeArg, error) {
 	s = strings.TrimPrefix(s, "0x")
 	s = strings.Trim(s, ":")
+	s = strings.Trim(s, ".")
 	b, err := hex.DecodeString(s)
 	if err != nil {
 		return nil, err
 	}
 	if len(b) < 5 {
-		return nil, fmt.Errorf("hex too short")
+		return nil, ErrHexTooShort
 	}
 	var ras []routeArg
+	// each routeArg is concatenated to the next, process
+	// in turn.
 	for len(b) >= 5 {
 		var ra routeArg
 		ones := int(b[0])
 		if ones > 32 {
-			return nil, fmt.Errorf("mask too large")
+			return nil, ErrMaskTooLarge
 		}
+		// calculate significant digits
 		sigs := sigBytes(ones)
-		ra.ipnet.IP = make([]byte, 4)
 
 		if len(b) < 5+sigs {
-			return nil, fmt.Errorf("invalid length")
+			return nil, ErrInvalidLength
 		}
+
+		ra.ipnet.IP = make([]byte, 4)
 		ra.route = make([]byte, 4)
 		copy(ra.route, b[1+sigs:5+sigs])
 		ra.ipnet.Mask = net.CIDRMask(ones, 32)
@@ -89,7 +111,12 @@ func (ras routeArgs) String() string {
 		sb.WriteString("0x")
 	}
 	for _, ra := range ras {
-		sb.WriteString(ra.encode())
+		s, err := ra.encode()
+		if err != nil {
+			sb.WriteString(fmt.Sprintf("\n\nerror: %s\n\n", err))
+		} else {
+			sb.WriteString(s)
+		}
 	}
 	return sb.String()
 }
@@ -102,8 +129,8 @@ func (ras *routeArgs) Set(s string) error {
 	var ipnet *net.IPNet
 	var ip net.IP
 	if len(pieces) == 1 {
-		// classful - we only have an ip to route to, infer
-		// subnet from class
+		// we only have an ip to route to, treat
+		// this as a 0.0.0.0/0 (default)
 		ip = net.ParseIP(pieces[0])
 		if ip == nil {
 			return errors.New("could not parse IP")
@@ -119,21 +146,22 @@ func (ras *routeArgs) Set(s string) error {
 		*ras = append(*ras, ra)
 		return nil
 	}
+	// if we get here, pieces[0] is the network / mask, pieces[1] is the gateway
 	_, ipnet, err := net.ParseCIDR(pieces[0])
 	if err != nil {
 		return err
 	}
 	_, size := ipnet.Mask.Size()
 	if size != 32 {
-		return errors.New("invalid route arguments - net must be ipv4")
+		return ErrMaskTooLarge
 	}
 	ip = net.ParseIP(pieces[1])
 	if ip == nil {
-		return errors.New("invalid ip address")
+		return ErrIPNotV4
 	}
 	ip = ip.To4()
 	if ip == nil {
-		return errors.New("ipv6 not supported")
+		return ErrIPNotV4
 	}
 	*ras = append(*ras, routeArg{
 		ipnet: *ipnet,
@@ -184,7 +212,7 @@ func (o *Option121Cmd) Run(args []string) int {
 	default:
 		ras, err := routeArgsFromHex(o.encodedArg)
 		if err != nil {
-			log.Fatalf("fuck: %s", err)
+			log.Fatalf("error: %s", err)
 		}
 		for _, ra := range ras {
 			fmt.Printf("net: %s -> %s\n", ra.ipnet.String(), ra.route)
